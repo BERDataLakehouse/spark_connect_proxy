@@ -362,7 +362,7 @@ class TestAuthenticate:
 
         context.abort.assert_awaited_once()
         args = context.abort.call_args[0]
-        assert args[0] == grpc.StatusCode.UNAVAILABLE
+        assert args[0] == grpc.StatusCode.FAILED_PRECONDITION
         assert "not reachable" in args[1]
         assert "jupyter-tgu3" in args[1]
         assert "BERDL JupyterHub" in args[1]

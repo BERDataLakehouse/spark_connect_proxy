@@ -226,7 +226,7 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
                 self._settings.BACKEND_CONNECT_TIMEOUT,
             )
             await context.abort(
-                grpc.StatusCode.UNAVAILABLE,
+                grpc.StatusCode.FAILED_PRECONDITION,
                 f"Spark Connect server at {target} is not reachable. "
                 f"Please ensure you have logged in to BERDL JupyterHub "
                 f"and your notebook's Spark Connect service is running.",
