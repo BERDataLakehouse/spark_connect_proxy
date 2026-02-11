@@ -55,7 +55,7 @@ class TestExtractToken:
 
 
 class TestChannelPool:
-    """Tests for ChannelPool."""
+    """Tests for ChannelPool with LRU eviction."""
 
     def test_reuses_channels(self) -> None:
         pool = ChannelPool()
@@ -85,6 +85,40 @@ class TestChannelPool:
         ch1.close.assert_awaited_once()
         ch2.close.assert_awaited_once()
         assert len(pool._channels) == 0
+
+    def test_lru_eviction(self) -> None:
+        """Evicts least-recently-used channel when pool is full."""
+        pool = ChannelPool(max_size=2)
+
+        pool.get_channel("target1:15002")
+        pool.get_channel("target2:15002")
+        assert len(pool._channels) == 2
+
+        # Access target1 to make target2 the LRU
+        pool.get_channel("target1:15002")
+
+        # Adding target3 should evict target2 (LRU)
+        with patch("spark_connect_proxy.proxy.asyncio.ensure_future"):
+            pool.get_channel("target3:15002")
+
+        assert len(pool._channels) == 2
+        assert "target1:15002" in pool._channels
+        assert "target3:15002" in pool._channels
+        assert "target2:15002" not in pool._channels
+
+    def test_updates_last_used_on_access(self) -> None:
+        """Accessing an existing channel updates its last-used timestamp."""
+        pool = ChannelPool()
+        pool.get_channel("target1:15002")
+        _, ts1 = pool._channels["target1:15002"]
+
+        import time
+
+        time.sleep(0.01)
+        pool.get_channel("target1:15002")
+        _, ts2 = pool._channels["target1:15002"]
+
+        assert ts2 > ts1
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +150,6 @@ class TestProxyFunctions:
         """_proxy_unary_stream yields all responses from the backend."""
         mock_channel = MagicMock()
 
-        # Create an async iterator for the streaming response
         async def mock_stream(*_args, **_kwargs):
             for chunk in [b"chunk-1", b"chunk-2", b"chunk-3"]:
                 yield chunk
@@ -185,21 +218,19 @@ class TestSparkConnectProxyHandler:
         result = self.handler.service(details)
         assert result is None
 
-    def test_valid_unary_unary(self) -> None:
-        """Valid token for a unary-unary method returns a handler."""
-        self.validator.get_username.return_value = "alice"
+    def test_valid_unary_unary_returns_handler(self) -> None:
+        """Valid unary-unary method returns a handler (auth deferred to async)."""
         metadata = (("x-kbase-token", "valid"),)
         details = self._make_call_details(
             "/spark.connect.SparkConnectService/AnalyzePlan", metadata
         )
         result = self.handler.service(details)
         assert result is not None
-        self.validator.get_username.assert_called_once_with("valid")
-        self.pool.get_channel.assert_called_once_with("jupyter-alice.test-ns.svc.local:15002")
+        # Auth should NOT be called in service() — it's deferred
+        self.validator.get_username.assert_not_called()
 
-    def test_valid_unary_stream(self) -> None:
-        """Valid token for a server-streaming method returns a handler."""
-        self.validator.get_username.return_value = "bob"
+    def test_valid_unary_stream_returns_handler(self) -> None:
+        """Valid unary-stream method returns a handler."""
         metadata = (("x-kbase-token", "valid"),)
         details = self._make_call_details(
             "/spark.connect.SparkConnectService/ExecutePlan", metadata
@@ -207,9 +238,8 @@ class TestSparkConnectProxyHandler:
         result = self.handler.service(details)
         assert result is not None
 
-    def test_valid_stream_unary(self) -> None:
-        """Valid token for a client-streaming method returns a handler."""
-        self.validator.get_username.return_value = "carol"
+    def test_valid_stream_unary_returns_handler(self) -> None:
+        """Valid stream-unary method returns a handler."""
         metadata = (("x-kbase-token", "valid"),)
         details = self._make_call_details(
             "/spark.connect.SparkConnectService/AddArtifacts", metadata
@@ -217,44 +247,96 @@ class TestSparkConnectProxyHandler:
         result = self.handler.service(details)
         assert result is not None
 
-    def test_missing_token_returns_unauthenticated_handler(self) -> None:
-        """Missing token returns an error handler (not None)."""
-        metadata = (("other-header", "value"),)
-        details = self._make_call_details("/spark.connect.SparkConnectService/Config", metadata)
+    def test_no_metadata_still_returns_handler(self) -> None:
+        """Missing metadata still returns a handler — auth failure happens in async."""
+        details = self._make_call_details("/spark.connect.SparkConnectService/Config", None)
         result = self.handler.service(details)
-        # Should return an error handler, not None
+        # Handler is returned; auth will fail when invoked asynchronously
         assert result is not None
-        self.pool.get_channel.assert_not_called()
 
-    def test_invalid_token_returns_unauthenticated_handler(self) -> None:
-        """Invalid token returns an error handler."""
+
+# ---------------------------------------------------------------------------
+# Async authentication tests
+# ---------------------------------------------------------------------------
+
+
+class TestAuthenticate:
+    """Tests for the async _authenticate method."""
+
+    def setup_method(self) -> None:
+        self.settings = ProxySettings(
+            BACKEND_NAMESPACE="test-ns",
+            SERVICE_TEMPLATE="jupyter-{username}.{namespace}.svc.local",
+        )
+        self.validator = MagicMock(spec=TokenValidator)
+        self.pool = ChannelPool()
+        self.handler = SparkConnectProxyHandler(self.settings, self.validator, self.pool)
+
+    @pytest.mark.asyncio
+    async def test_authenticate_success(self) -> None:
+        """Successful auth returns channel and forward metadata."""
+        self.validator.get_username.return_value = "alice"
+        metadata = (("x-kbase-token", "valid-token"),)
+        context = AsyncMock()
+
+        channel, fwd_metadata = await self.handler._authenticate(metadata, context)
+
+        assert channel is not None
+        assert ("x-kbase-token", "valid-token") in fwd_metadata
+        context.abort.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_authenticate_routes_correctly(self) -> None:
+        """Auth resolves to correct backend target."""
+        self.validator.get_username.return_value = "tgu2"
+        metadata = (("x-kbase-token", "tok"),)
+        context = AsyncMock()
+
+        channel, _ = await self.handler._authenticate(metadata, context)
+
+        # Should have created a channel for the user's backend
+        assert "jupyter-tgu2.test-ns.svc.local:15002" in self.pool._channels
+
+    @pytest.mark.asyncio
+    async def test_authenticate_missing_token(self) -> None:
+        """Missing token aborts with UNAUTHENTICATED."""
+        metadata = (("other-header", "value"),)
+        context = AsyncMock()
+        context.abort = AsyncMock(side_effect=grpc.RpcError())
+
+        with pytest.raises(grpc.RpcError):
+            await self.handler._authenticate(metadata, context)
+
+        context.abort.assert_awaited_once()
+        args = context.abort.call_args[0]
+        assert args[0] == grpc.StatusCode.UNAUTHENTICATED
+
+    @pytest.mark.asyncio
+    async def test_authenticate_invalid_token(self) -> None:
+        """Invalid token aborts with UNAUTHENTICATED."""
         self.validator.get_username.side_effect = AuthError("Invalid token")
         metadata = (("x-kbase-token", "bad"),)
-        details = self._make_call_details("/spark.connect.SparkConnectService/Config", metadata)
-        result = self.handler.service(details)
-        assert result is not None
-        self.pool.get_channel.assert_not_called()
+        context = AsyncMock()
+        context.abort = AsyncMock(side_effect=grpc.RpcError())
 
-    def test_routes_to_correct_user(self) -> None:
+        with pytest.raises(grpc.RpcError):
+            await self.handler._authenticate(metadata, context)
+
+        context.abort.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_authenticate_different_users(self) -> None:
         """Different tokens route to different backends."""
-        # First user
-        self.validator.get_username.return_value = "tgu2"
-        details = self._make_call_details(
-            "/spark.connect.SparkConnectService/Config",
-            (("x-kbase-token", "token-tgu2"),),
-        )
-        self.handler.service(details)
-        self.pool.get_channel.assert_called_with("jupyter-tgu2.test-ns.svc.local:15002")
+        context = AsyncMock()
 
-        # Second user
-        self.pool.reset_mock()
+        self.validator.get_username.return_value = "tgu2"
+        await self.handler._authenticate((("x-kbase-token", "tok1"),), context)
+
         self.validator.get_username.return_value = "bsadkhin"
-        details = self._make_call_details(
-            "/spark.connect.SparkConnectService/Config",
-            (("x-kbase-token", "token-boris"),),
-        )
-        self.handler.service(details)
-        self.pool.get_channel.assert_called_with("jupyter-bsadkhin.test-ns.svc.local:15002")
+        await self.handler._authenticate((("x-kbase-token", "tok2"),), context)
+
+        assert "jupyter-tgu2.test-ns.svc.local:15002" in self.pool._channels
+        assert "jupyter-bsadkhin.test-ns.svc.local:15002" in self.pool._channels
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +345,7 @@ class TestSparkConnectProxyHandler:
 
 
 class TestHandlerBehaviors:
-    """Tests that actually invoke the async handler behaviors returned by service()."""
+    """Tests that invoke the async handler behaviors returned by service()."""
 
     def setup_method(self) -> None:
         self.settings = ProxySettings(
@@ -284,23 +366,23 @@ class TestHandlerBehaviors:
         return details
 
     @pytest.mark.asyncio
-    async def test_unary_unary_behavior_invokes_proxy(self) -> None:
-        """The unary-unary handler behavior calls _proxy_unary_unary."""
+    async def test_unary_unary_behavior(self) -> None:
+        """The unary-unary handler authenticates and proxies."""
         metadata = (("x-kbase-token", "tok"),)
         details = self._make_call_details("/spark.connect.SparkConnectService/Config", metadata)
         result = self.handler.service(details)
         assert result is not None
 
-        # Patch the channel's unary_unary to return a callable
         with patch("spark_connect_proxy.proxy._proxy_unary_unary", new_callable=AsyncMock) as mock:
             mock.return_value = b"response"
-            context = MagicMock()
+            context = AsyncMock()
             response = await result.unary_unary(b"request", context)
             assert response == b"response"
+            mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_unary_stream_behavior_invokes_proxy(self) -> None:
-        """The unary-stream handler behavior calls _proxy_unary_stream."""
+    async def test_unary_stream_behavior(self) -> None:
+        """The unary-stream handler authenticates and proxies."""
         metadata = (("x-kbase-token", "tok"),)
         details = self._make_call_details(
             "/spark.connect.SparkConnectService/ExecutePlan", metadata
@@ -313,15 +395,15 @@ class TestHandlerBehaviors:
             yield b"chunk-2"
 
         with patch("spark_connect_proxy.proxy._proxy_unary_stream", side_effect=mock_proxy):
-            context = MagicMock()
+            context = AsyncMock()
             chunks = []
             async for chunk in result.unary_stream(b"request", context):
                 chunks.append(chunk)
             assert chunks == [b"chunk-1", b"chunk-2"]
 
     @pytest.mark.asyncio
-    async def test_stream_unary_behavior_invokes_proxy(self) -> None:
-        """The stream-unary handler behavior calls _proxy_stream_unary."""
+    async def test_stream_unary_behavior(self) -> None:
+        """The stream-unary handler authenticates and proxies."""
         metadata = (("x-kbase-token", "tok"),)
         details = self._make_call_details(
             "/spark.connect.SparkConnectService/AddArtifacts", metadata
@@ -335,88 +417,9 @@ class TestHandlerBehaviors:
             async def request_iter():
                 yield b"part"
 
-            context = MagicMock()
+            context = AsyncMock()
             response = await result.stream_unary(request_iter(), context)
             assert response == b"aggregated"
-
-
-# ---------------------------------------------------------------------------
-# Unauthenticated handler tests
-# ---------------------------------------------------------------------------
-
-
-class TestUnauthenticatedHandlers:
-    """Tests for _unauthenticated_handler for all RPC types."""
-
-    def setup_method(self) -> None:
-        self.settings = ProxySettings(
-            BACKEND_NAMESPACE="test-ns",
-            SERVICE_TEMPLATE="jupyter-{username}.{namespace}.svc.local",
-        )
-        self.validator = MagicMock(spec=TokenValidator)
-        self.pool = MagicMock(spec=ChannelPool)
-        self.handler = SparkConnectProxyHandler(self.settings, self.validator, self.pool)
-
-    def test_unauthenticated_unary_unary(self) -> None:
-        """Returns unary-unary abort handler for unary-unary methods."""
-        result = self.handler._unauthenticated_handler("bad token", "unary", "unary")
-        assert result is not None
-        assert result.unary_unary is not None
-
-    def test_unauthenticated_unary_stream(self) -> None:
-        """Returns unary-stream abort handler for server-streaming methods."""
-        result = self.handler._unauthenticated_handler("bad token", "unary", "stream")
-        assert result is not None
-        assert result.unary_stream is not None
-
-    def test_unauthenticated_stream_unary(self) -> None:
-        """Returns stream-unary abort handler for client-streaming methods."""
-        result = self.handler._unauthenticated_handler("bad token", "stream", "unary")
-        assert result is not None
-        assert result.stream_unary is not None
-
-    def test_unauthenticated_unknown_type_fallback(self) -> None:
-        """Unknown RPC types fall back to unary-unary abort handler."""
-        result = self.handler._unauthenticated_handler("bad token", "stream", "stream")
-        assert result is not None
-        assert result.unary_unary is not None
-
-    @pytest.mark.asyncio
-    async def test_abort_unary_calls_context_abort(self) -> None:
-        """The unary abort handler calls context.abort with UNAUTHENTICATED."""
-        result = self.handler._unauthenticated_handler("invalid", "unary", "unary")
-        context = AsyncMock()
-        context.abort = AsyncMock(side_effect=grpc.RpcError())
-
-        with pytest.raises(grpc.RpcError):
-            await result.unary_unary(b"req", context)
-        context.abort.assert_awaited_once_with(grpc.StatusCode.UNAUTHENTICATED, "invalid")
-
-    @pytest.mark.asyncio
-    async def test_abort_stream_calls_context_abort(self) -> None:
-        """The stream abort handler calls context.abort with UNAUTHENTICATED."""
-        result = self.handler._unauthenticated_handler("invalid", "unary", "stream")
-        context = AsyncMock()
-        context.abort = AsyncMock(side_effect=grpc.RpcError())
-
-        with pytest.raises(grpc.RpcError):
-            async for _ in result.unary_stream(b"req", context):
-                pass
-        context.abort.assert_awaited_once_with(grpc.StatusCode.UNAUTHENTICATED, "invalid")
-
-    @pytest.mark.asyncio
-    async def test_abort_client_stream_calls_context_abort(self) -> None:
-        """The client-stream abort handler calls context.abort with UNAUTHENTICATED."""
-        result = self.handler._unauthenticated_handler("invalid", "stream", "unary")
-        context = AsyncMock()
-        context.abort = AsyncMock(side_effect=grpc.RpcError())
-
-        async def request_iter():
-            yield b"data"
-
-        with pytest.raises(grpc.RpcError):
-            await result.stream_unary(request_iter(), context)
-        context.abort.assert_awaited_once_with(grpc.StatusCode.UNAUTHENTICATED, "invalid")
 
 
 # ---------------------------------------------------------------------------
@@ -431,17 +434,24 @@ class TestServe:
     async def test_serve_starts_and_stops(self) -> None:
         """serve() creates a server, starts it, and can be shut down."""
         mock_server = AsyncMock()
-        # Simulate termination by raising an exception
         mock_server.wait_for_termination = AsyncMock(side_effect=asyncio.CancelledError)
+        # Make sync methods return non-coroutines
+        mock_server.add_generic_rpc_handlers = MagicMock()
+        mock_server.add_insecure_port = MagicMock()
 
         with (
             patch("spark_connect_proxy.proxy.aio.server", return_value=mock_server),
             patch("spark_connect_proxy.proxy.TokenValidator"),
             patch("spark_connect_proxy.proxy.ChannelPool") as mock_pool_cls,
+            patch("spark_connect_proxy.proxy.health.HealthServicer") as mock_health_cls,
+            patch("spark_connect_proxy.proxy.health_pb2_grpc.add_HealthServicer_to_server"),
         ):
             mock_pool = MagicMock()
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
+
+            mock_health = AsyncMock()
+            mock_health_cls.return_value = mock_health
 
             settings = ProxySettings()
 
@@ -459,15 +469,22 @@ class TestServe:
         """serve() creates default ProxySettings when none provided."""
         mock_server = AsyncMock()
         mock_server.wait_for_termination = AsyncMock(side_effect=asyncio.CancelledError)
+        mock_server.add_generic_rpc_handlers = MagicMock()
+        mock_server.add_insecure_port = MagicMock()
 
         with (
             patch("spark_connect_proxy.proxy.aio.server", return_value=mock_server),
             patch("spark_connect_proxy.proxy.TokenValidator") as mock_validator_cls,
             patch("spark_connect_proxy.proxy.ChannelPool") as mock_pool_cls,
+            patch("spark_connect_proxy.proxy.health.HealthServicer") as mock_health_cls,
+            patch("spark_connect_proxy.proxy.health_pb2_grpc.add_HealthServicer_to_server"),
         ):
             mock_pool = MagicMock()
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
+
+            mock_health = AsyncMock()
+            mock_health_cls.return_value = mock_health
 
             with pytest.raises(asyncio.CancelledError):
                 await serve()  # No settings — uses defaults
@@ -477,19 +494,58 @@ class TestServe:
             assert call_kwargs["auth_url"] == "https://kbase.us/services/auth/"
 
     @pytest.mark.asyncio
-    async def test_serve_listen_address(self) -> None:
-        """serve() binds to the configured port."""
+    async def test_serve_registers_health_check(self) -> None:
+        """serve() registers gRPC health check service."""
         mock_server = AsyncMock()
         mock_server.wait_for_termination = AsyncMock(side_effect=asyncio.CancelledError)
+        mock_server.add_generic_rpc_handlers = MagicMock()
+        mock_server.add_insecure_port = MagicMock()
 
         with (
             patch("spark_connect_proxy.proxy.aio.server", return_value=mock_server),
             patch("spark_connect_proxy.proxy.TokenValidator"),
             patch("spark_connect_proxy.proxy.ChannelPool") as mock_pool_cls,
+            patch("spark_connect_proxy.proxy.health.HealthServicer") as mock_health_cls,
+            patch(
+                "spark_connect_proxy.proxy.health_pb2_grpc.add_HealthServicer_to_server"
+            ) as mock_add,
         ):
             mock_pool = MagicMock()
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
+
+            mock_health = AsyncMock()
+            mock_health_cls.return_value = mock_health
+
+            with pytest.raises(asyncio.CancelledError):
+                await serve(ProxySettings())
+
+            # Health servicer should be added to the server
+            mock_add.assert_called_once_with(mock_health, mock_server)
+            # Health status should be set to SERVING
+            assert mock_health.set.await_count >= 2  # overall + service-specific
+
+    @pytest.mark.asyncio
+    async def test_serve_listen_address(self) -> None:
+        """serve() binds to the configured port."""
+        mock_server = AsyncMock()
+        mock_server.wait_for_termination = AsyncMock(side_effect=asyncio.CancelledError)
+        mock_server.add_generic_rpc_handlers = MagicMock()
+        mock_server.add_insecure_port = MagicMock()
+
+        with (
+            patch("spark_connect_proxy.proxy.aio.server", return_value=mock_server),
+            patch("spark_connect_proxy.proxy.TokenValidator"),
+            patch("spark_connect_proxy.proxy.ChannelPool") as mock_pool_cls,
+            patch("spark_connect_proxy.proxy.health.HealthServicer") as mock_health_cls,
+            patch("spark_connect_proxy.proxy.health_pb2_grpc.add_HealthServicer_to_server"),
+        ):
+            mock_pool = MagicMock()
+            mock_pool.close_all = AsyncMock()
+            mock_pool_cls.return_value = mock_pool
+
+            mock_health = AsyncMock()
+            mock_health_cls.return_value = mock_health
 
             settings = ProxySettings(PROXY_LISTEN_PORT=9999)
 

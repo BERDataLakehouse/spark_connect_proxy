@@ -7,11 +7,14 @@ based on the KBase authentication token in the request metadata.
 Messages are forwarded as opaque bytes — no proto definitions required.
 """
 
+import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 
 import grpc
 from grpc import aio
+from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from spark_connect_proxy.auth import AuthError, TokenValidator
 from spark_connect_proxy.config import ProxySettings
@@ -51,26 +54,51 @@ def _extract_token(metadata: tuple[tuple[str, str | bytes], ...] | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Channel pool — reuse channels to the same backend
+# Channel pool — reuse channels to the same backend with LRU eviction
 # ---------------------------------------------------------------------------
 
 
 class ChannelPool:
-    """Manages a pool of gRPC channels to backend Spark Connect servers."""
+    """Manages a pool of gRPC channels to backend Spark Connect servers.
 
-    def __init__(self) -> None:
-        self._channels: dict[str, aio.Channel] = {}
+    Tracks last-used time for each channel and evicts least-recently-used
+    entries when the pool exceeds max_size.
+    """
+
+    def __init__(self, max_size: int = 100) -> None:
+        self._max_size = max_size
+        # target → (channel, last_used_timestamp)
+        self._channels: dict[str, tuple[aio.Channel, float]] = {}
 
     def get_channel(self, target: str) -> aio.Channel:
         """Get or create a channel to the specified backend target."""
-        if target not in self._channels:
-            logger.info("Opening channel to backend: %s", target)
-            self._channels[target] = aio.insecure_channel(target)
-        return self._channels[target]
+        if target in self._channels:
+            channel, _ = self._channels[target]
+            self._channels[target] = (channel, time.monotonic())
+            return channel
+
+        # Evict LRU if at capacity
+        if len(self._channels) >= self._max_size:
+            self._evict_lru()
+
+        logger.info("Opening channel to backend: %s", target)
+        channel = aio.insecure_channel(target)
+        self._channels[target] = (channel, time.monotonic())
+        return channel
+
+    def _evict_lru(self) -> None:
+        """Evict the least-recently-used channel."""
+        if not self._channels:
+            return
+        lru_target = min(self._channels, key=lambda t: self._channels[t][1])
+        channel, _ = self._channels.pop(lru_target)
+        logger.info("Evicting idle channel to: %s", lru_target)
+        # Close asynchronously — fire and forget
+        asyncio.ensure_future(channel.close())
 
     async def close_all(self) -> None:
         """Close all open channels."""
-        for target, channel in self._channels.items():
+        for target, (channel, _) in self._channels.items():
             logger.info("Closing channel to: %s", target)
             await channel.close()
         self._channels.clear()
@@ -142,7 +170,7 @@ async def _proxy_stream_unary(
 
 
 # ---------------------------------------------------------------------------
-# Generic RPC handler
+# Generic RPC handler — authentication is deferred to async context
 # ---------------------------------------------------------------------------
 
 
@@ -150,12 +178,42 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
     """
     Generic gRPC handler that intercepts all Spark Connect RPCs and proxies
     them to the correct user's backend based on KBase token authentication.
+
+    Authentication is performed inside the async handler behaviors (not in
+    the synchronous service() method) to avoid blocking the event loop.
     """
 
     def __init__(self, settings: ProxySettings, validator: TokenValidator, pool: ChannelPool):
         self._settings = settings
         self._validator = validator
         self._pool = pool
+
+    async def _authenticate(
+        self, metadata: tuple[tuple[str, str | bytes], ...] | None, context: aio.ServicerContext
+    ) -> tuple[aio.Channel, tuple[tuple[str, str | bytes], ...]]:
+        """Authenticate and resolve backend — runs in async context.
+
+        Returns:
+            (channel, forward_metadata) tuple on success.
+
+        Raises:
+            Aborts the gRPC context with UNAUTHENTICATED on failure.
+        """
+        try:
+            token = _extract_token(metadata)
+            # Run the synchronous auth call in a thread to avoid blocking
+            username = await asyncio.to_thread(self._validator.get_username, token)
+        except AuthError as e:
+            logger.warning("Authentication failed: %s", e)
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, str(e))
+            raise  # unreachable after abort, satisfies type checker
+
+        target = self._settings.backend_target(username)
+        channel = self._pool.get_channel(target)
+        fwd_metadata: tuple[tuple[str, str | bytes], ...] = tuple(metadata) if metadata else ()
+
+        logger.debug("Proxying for user %s → %s", username, target)
+        return channel, fwd_metadata
 
     def service(
         self, handler_call_details: grpc.HandlerCallDetails
@@ -168,27 +226,12 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
         req_type, resp_type = SPARK_CONNECT_METHODS[method]
         metadata = handler_call_details.invocation_metadata
 
-        # Authenticate and resolve backend target
-        try:
-            token = _extract_token(metadata)
-            username = self._validator.get_username(token)
-        except AuthError as e:
-            logger.warning("Authentication failed: %s", e)
-            return self._unauthenticated_handler(str(e), req_type, resp_type)
-
-        target = self._settings.backend_target(username)
-        channel = self._pool.get_channel(target)
-
-        # Forward original metadata (including x-kbase-token for server-side validation)
-        fwd_metadata: tuple[tuple[str, str | bytes], ...] = tuple(metadata) if metadata else ()
-
-        logger.debug("Proxying %s for user %s → %s", method, username, target)
-
         # Return the appropriate handler type
-        # Return the appropriate handler type
+        # Authentication is deferred to the async behavior function
         if req_type == "unary" and resp_type == "unary":
 
-            async def unary_unary_behavior(request, context):
+            async def unary_unary_behavior(request: bytes, context: aio.ServicerContext) -> bytes:
+                channel, fwd_metadata = await self._authenticate(metadata, context)
                 return await _proxy_unary_unary(method, request, context, channel, fwd_metadata)
 
             return grpc.unary_unary_rpc_method_handler(
@@ -198,7 +241,10 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
             )
         elif req_type == "unary" and resp_type == "stream":
 
-            async def unary_stream_behavior(request, context):
+            async def unary_stream_behavior(
+                request: bytes, context: aio.ServicerContext
+            ) -> AsyncIterator[bytes]:
+                channel, fwd_metadata = await self._authenticate(metadata, context)
                 async for response in _proxy_unary_stream(
                     method, request, context, channel, fwd_metadata
                 ):
@@ -211,7 +257,10 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
             )
         elif req_type == "stream" and resp_type == "unary":
 
-            async def stream_unary_behavior(request_iterator, context):
+            async def stream_unary_behavior(
+                request_iterator: AsyncIterator[bytes], context: aio.ServicerContext
+            ) -> bytes:
+                channel, fwd_metadata = await self._authenticate(metadata, context)
                 return await _proxy_stream_unary(
                     method, request_iterator, context, channel, fwd_metadata
                 )
@@ -223,53 +272,6 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
             )
         else:
             return None
-
-    def _unauthenticated_handler(
-        self, message: str, req_type: str, resp_type: str
-    ) -> grpc.RpcMethodHandler:
-        """Return a handler that immediately aborts with UNAUTHENTICATED."""
-
-        async def _abort_unary(_request: bytes, context: aio.ServicerContext) -> bytes:
-            await context.abort(grpc.StatusCode.UNAUTHENTICATED, message)
-            return b""  # unreachable but satisfies type checker
-
-        async def _abort_stream(
-            _request: bytes, context: aio.ServicerContext
-        ) -> AsyncIterator[bytes]:
-            await context.abort(grpc.StatusCode.UNAUTHENTICATED, message)
-            return  # type: ignore[return-value]
-            yield  # noqa: F841 — unreachable, makes this a generator
-
-        async def _abort_client_stream(
-            _request_iterator: AsyncIterator[bytes], context: aio.ServicerContext
-        ) -> bytes:
-            await context.abort(grpc.StatusCode.UNAUTHENTICATED, message)
-            return b""
-
-        if req_type == "unary" and resp_type == "unary":
-            return grpc.unary_unary_rpc_method_handler(
-                _abort_unary,
-                request_deserializer=_IDENTITY,
-                response_serializer=_IDENTITY,
-            )
-        elif req_type == "unary" and resp_type == "stream":
-            return grpc.unary_stream_rpc_method_handler(
-                _abort_stream,
-                request_deserializer=_IDENTITY,
-                response_serializer=_IDENTITY,
-            )
-        elif req_type == "stream" and resp_type == "unary":
-            return grpc.stream_unary_rpc_method_handler(
-                _abort_client_stream,
-                request_deserializer=_IDENTITY,
-                response_serializer=_IDENTITY,
-            )
-        else:
-            return grpc.unary_unary_rpc_method_handler(
-                _abort_unary,
-                request_deserializer=_IDENTITY,
-                response_serializer=_IDENTITY,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +290,23 @@ async def serve(settings: ProxySettings | None = None) -> None:
         cache_max_size=settings.TOKEN_CACHE_MAX_SIZE,
         require_mfa=settings.REQUIRE_MFA,
     )
-    pool = ChannelPool()
+    pool = ChannelPool(max_size=settings.MAX_CHANNELS_PER_BACKEND)
     handler = SparkConnectProxyHandler(settings, validator, pool)
 
     server = aio.server()
     server.add_generic_rpc_handlers([handler])
+
+    # Register gRPC health check service
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    # Mark the proxy as serving
+    await health_servicer.set(
+        "spark.connect.SparkConnectService",
+        health_pb2.HealthCheckResponse.SERVING,
+    )
+    # Also set the overall server health
+    await health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+
     listen_addr = f"[::]:{settings.PROXY_LISTEN_PORT}"
     server.add_insecure_port(listen_addr)
 
@@ -305,6 +319,12 @@ async def serve(settings: ProxySettings | None = None) -> None:
         await server.wait_for_termination()
     finally:
         logger.info("Shutting down proxy server...")
+        # Mark as not serving before closing
+        await health_servicer.set(
+            "spark.connect.SparkConnectService",
+            health_pb2.HealthCheckResponse.NOT_SERVING,
+        )
+        await health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
         await pool.close_all()
         await server.stop(grace=5)
         logger.info("Proxy server stopped.")
