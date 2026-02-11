@@ -50,4 +50,5 @@ venv.bak/
 *.swp
 *.swo
 .DS_Store
+pyrightconfig.json
 kubernetes/

@@ -29,6 +29,9 @@ class ProxySettings(BaseSettings):
     # Maximum number of cached tokens
     TOKEN_CACHE_MAX_SIZE: int = 1000
 
+    # Whether to require MFA for token validation
+    REQUIRE_MFA: bool = True
+
     # Maximum concurrent gRPC connections to keep per backend
     MAX_CHANNELS_PER_BACKEND: int = 5
 
