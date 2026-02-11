@@ -35,6 +35,9 @@ class ProxySettings(BaseSettings):
     # Maximum concurrent gRPC connections to keep per backend
     MAX_CHANNELS_PER_BACKEND: int = 5
 
+    # Timeout (seconds) for initial backend connectivity check
+    BACKEND_CONNECT_TIMEOUT: float = 5.0
+
     model_config = {"env_prefix": ""}
 
     def backend_target(self, username: str) -> str:

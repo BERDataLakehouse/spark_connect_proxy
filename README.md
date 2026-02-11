@@ -34,11 +34,11 @@ User (PySpark) → Ingress (spark.berdl.kbase.us:443) → Spark Connect Proxy �
 
 ```bash
 # Install
-pip install -e ".[dev]"
+uv sync --dev
 
 # Run tests
-pytest
+uv run pytest
 
 # Run locally
-python -m spark_connect_proxy
+uv run python -m spark_connect_proxy
 ```
