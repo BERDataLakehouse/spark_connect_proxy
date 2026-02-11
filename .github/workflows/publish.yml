@@ -1,0 +1,20 @@
+name: Build and push docker image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master", "develop" ]
+  release:
+    types: [published]
+
+jobs:
+  build:
+    uses: BERDataLakehouse/.github/.github/workflows/build_docker_image.yaml@main
+    with:
+      free_disk_space: true
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
