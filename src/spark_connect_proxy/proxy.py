@@ -191,13 +191,14 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
     async def _authenticate(
         self, metadata: tuple[tuple[str, str | bytes], ...] | None, context: aio.ServicerContext
     ) -> tuple[aio.Channel, tuple[tuple[str, str | bytes], ...]]:
-        """Authenticate and resolve backend — runs in async context.
+        """Authenticate, resolve backend, and verify connectivity.
 
         Returns:
             (channel, forward_metadata) tuple on success.
 
         Raises:
-            Aborts the gRPC context with UNAUTHENTICATED on failure.
+            Aborts the gRPC context with UNAUTHENTICATED on auth failure,
+            or UNAVAILABLE if the backend is not reachable.
         """
         try:
             token = _extract_token(metadata)
@@ -210,6 +211,28 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
 
         target = self._settings.backend_target(username)
         channel = self._pool.get_channel(target)
+
+        # Fast connectivity check — fail early if backend is unreachable
+        try:
+            await asyncio.wait_for(
+                channel.channel_ready(),
+                timeout=self._settings.BACKEND_CONNECT_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.error(
+                "Backend %s unreachable for user %s (timeout=%.1fs)",
+                target,
+                username,
+                self._settings.BACKEND_CONNECT_TIMEOUT,
+            )
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                f"Spark Connect server at {target} is not reachable. "
+                f"Please ensure you have logged in to BERDL JupyterHub "
+                f"and your notebook's Spark Connect service is running.",
+            )
+            raise  # unreachable after abort
+
         fwd_metadata: tuple[tuple[str, str | bytes], ...] = tuple(metadata) if metadata else ()
 
         logger.debug("Proxying for user %s → %s", username, target)
@@ -300,12 +323,12 @@ async def serve(settings: ProxySettings | None = None) -> None:
     health_servicer = health.HealthServicer()
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
     # Mark the proxy as serving
-    await health_servicer.set(
+    health_servicer.set(
         "spark.connect.SparkConnectService",
         health_pb2.HealthCheckResponse.SERVING,
     )
     # Also set the overall server health
-    await health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
 
     listen_addr = f"[::]:{settings.PROXY_LISTEN_PORT}"
     server.add_insecure_port(listen_addr)
@@ -320,11 +343,11 @@ async def serve(settings: ProxySettings | None = None) -> None:
     finally:
         logger.info("Shutting down proxy server...")
         # Mark as not serving before closing
-        await health_servicer.set(
+        health_servicer.set(
             "spark.connect.SparkConnectService",
             health_pb2.HealthCheckResponse.NOT_SERVING,
         )
-        await health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
+        health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
         await pool.close_all()
         await server.stop(grace=5)
         logger.info("Proxy server stopped.")

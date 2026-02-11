@@ -267,9 +267,13 @@ class TestAuthenticate:
         self.settings = ProxySettings(
             BACKEND_NAMESPACE="test-ns",
             SERVICE_TEMPLATE="jupyter-{username}.{namespace}.svc.local",
+            BACKEND_CONNECT_TIMEOUT=1.0,
         )
         self.validator = MagicMock(spec=TokenValidator)
-        self.pool = ChannelPool()
+        self.mock_channel = AsyncMock()
+        self.mock_channel.channel_ready = AsyncMock()  # resolves immediately
+        self.pool = MagicMock(spec=ChannelPool)
+        self.pool.get_channel = MagicMock(return_value=self.mock_channel)
         self.handler = SparkConnectProxyHandler(self.settings, self.validator, self.pool)
 
     @pytest.mark.asyncio
@@ -281,9 +285,10 @@ class TestAuthenticate:
 
         channel, fwd_metadata = await self.handler._authenticate(metadata, context)
 
-        assert channel is not None
+        assert channel is self.mock_channel
         assert ("x-kbase-token", "valid-token") in fwd_metadata
         context.abort.assert_not_called()
+        self.mock_channel.channel_ready.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_authenticate_routes_correctly(self) -> None:
@@ -292,10 +297,9 @@ class TestAuthenticate:
         metadata = (("x-kbase-token", "tok"),)
         context = AsyncMock()
 
-        channel, _ = await self.handler._authenticate(metadata, context)
+        await self.handler._authenticate(metadata, context)
 
-        # Should have created a channel for the user's backend
-        assert "jupyter-tgu2.test-ns.svc.local:15002" in self.pool._channels
+        self.pool.get_channel.assert_called_once_with("jupyter-tgu2.test-ns.svc.local:15002")
 
     @pytest.mark.asyncio
     async def test_authenticate_missing_token(self) -> None:
@@ -335,8 +339,46 @@ class TestAuthenticate:
         self.validator.get_username.return_value = "bsadkhin"
         await self.handler._authenticate((("x-kbase-token", "tok2"),), context)
 
-        assert "jupyter-tgu2.test-ns.svc.local:15002" in self.pool._channels
-        assert "jupyter-bsadkhin.test-ns.svc.local:15002" in self.pool._channels
+        assert self.pool.get_channel.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_authenticate_backend_unreachable(self) -> None:
+        """Unreachable backend aborts with UNAVAILABLE and clear error message."""
+        self.validator.get_username.return_value = "tgu3"
+
+        # Simulate channel_ready() that never completes
+        async def never_ready():
+            await asyncio.sleep(999)
+
+        self.mock_channel.channel_ready = never_ready
+        self.settings.BACKEND_CONNECT_TIMEOUT = 0.1  # short timeout for test
+
+        metadata = (("x-kbase-token", "tok"),)
+        context = AsyncMock()
+        context.abort = AsyncMock()
+
+        with pytest.raises(TimeoutError):
+            await self.handler._authenticate(metadata, context)
+
+        context.abort.assert_awaited_once()
+        args = context.abort.call_args[0]
+        assert args[0] == grpc.StatusCode.UNAVAILABLE
+        assert "not reachable" in args[1]
+        assert "jupyter-tgu3" in args[1]
+        assert "BERDL JupyterHub" in args[1]
+
+    @pytest.mark.asyncio
+    async def test_authenticate_backend_reachable(self) -> None:
+        """Reachable backend passes the connectivity check."""
+        self.validator.get_username.return_value = "tgu2"
+        # channel_ready resolves immediately (default mock behavior)
+        metadata = (("x-kbase-token", "tok"),)
+        context = AsyncMock()
+
+        channel, _ = await self.handler._authenticate(metadata, context)
+
+        assert channel is self.mock_channel
+        context.abort.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +396,10 @@ class TestHandlerBehaviors:
         )
         self.validator = MagicMock(spec=TokenValidator)
         self.validator.get_username.return_value = "testuser"
-        self.pool = ChannelPool()
+        self.mock_channel = AsyncMock()
+        self.mock_channel.channel_ready = AsyncMock()
+        self.pool = MagicMock(spec=ChannelPool)
+        self.pool.get_channel = MagicMock(return_value=self.mock_channel)
         self.handler = SparkConnectProxyHandler(self.settings, self.validator, self.pool)
 
     def _make_call_details(
@@ -450,7 +495,7 @@ class TestServe:
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
 
-            mock_health = AsyncMock()
+            mock_health = MagicMock()
             mock_health_cls.return_value = mock_health
 
             settings = ProxySettings()
@@ -483,7 +528,7 @@ class TestServe:
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
 
-            mock_health = AsyncMock()
+            mock_health = MagicMock()
             mock_health_cls.return_value = mock_health
 
             with pytest.raises(asyncio.CancelledError):
@@ -514,7 +559,7 @@ class TestServe:
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
 
-            mock_health = AsyncMock()
+            mock_health = MagicMock()
             mock_health_cls.return_value = mock_health
 
             with pytest.raises(asyncio.CancelledError):
@@ -523,7 +568,7 @@ class TestServe:
             # Health servicer should be added to the server
             mock_add.assert_called_once_with(mock_health, mock_server)
             # Health status should be set to SERVING
-            assert mock_health.set.await_count >= 2  # overall + service-specific
+            assert mock_health.set.call_count >= 2  # overall + service-specific
 
     @pytest.mark.asyncio
     async def test_serve_listen_address(self) -> None:
@@ -544,7 +589,7 @@ class TestServe:
             mock_pool.close_all = AsyncMock()
             mock_pool_cls.return_value = mock_pool
 
-            mock_health = AsyncMock()
+            mock_health = MagicMock()
             mock_health_cls.return_value = mock_health
 
             settings = ProxySettings(PROXY_LISTEN_PORT=9999)
