@@ -41,12 +41,12 @@ SPARK_CONNECT_METHODS: dict[str, tuple[str, str]] = {
 _IDENTITY = lambda x: x  # noqa: E731
 
 
-def _extract_token(metadata: tuple[tuple[str, str], ...] | None) -> str:
+def _extract_token(metadata: tuple[tuple[str, str | bytes], ...] | None) -> str:
     """Extract the x-kbase-token from gRPC invocation metadata."""
     if metadata:
         for key, value in metadata:
             if key == "x-kbase-token":
-                return value
+                return value.decode() if isinstance(value, bytes) else value
     raise AuthError("Missing x-kbase-token in request metadata")
 
 
@@ -86,15 +86,19 @@ async def _proxy_unary_unary(
     request: bytes,
     context: aio.ServicerContext,
     channel: aio.Channel,
-    metadata: tuple[tuple[str, str], ...],
+    metadata: tuple[tuple[str, str | bytes], ...],
 ) -> bytes:
     """Proxy a unary-unary RPC."""
-    response = await channel.unary_unary(
-        method,
-        request_serializer=_IDENTITY,
-        response_deserializer=_IDENTITY,
-    )(request, metadata=metadata)
-    return response
+    try:
+        response = await channel.unary_unary(
+            method,
+            request_serializer=_IDENTITY,
+            response_deserializer=_IDENTITY,
+        )(request, metadata=metadata)
+        return response
+    except aio.AioRpcError as e:
+        await context.abort(e.code(), e.details() or "Backend error")
+        return b""  # unreachable
 
 
 async def _proxy_unary_stream(
@@ -102,16 +106,19 @@ async def _proxy_unary_stream(
     request: bytes,
     context: aio.ServicerContext,
     channel: aio.Channel,
-    metadata: tuple[tuple[str, str], ...],
+    metadata: tuple[tuple[str, str | bytes], ...],
 ) -> AsyncIterator[bytes]:
     """Proxy a unary-stream (server streaming) RPC."""
-    call = channel.unary_stream(
-        method,
-        request_serializer=_IDENTITY,
-        response_deserializer=_IDENTITY,
-    )(request, metadata=metadata)
-    async for response in call:
-        yield response
+    try:
+        call = channel.unary_stream(
+            method,
+            request_serializer=_IDENTITY,
+            response_deserializer=_IDENTITY,
+        )(request, metadata=metadata)
+        async for response in call:
+            yield response
+    except aio.AioRpcError as e:
+        await context.abort(e.code(), e.details() or "Backend error")
 
 
 async def _proxy_stream_unary(
@@ -119,15 +126,19 @@ async def _proxy_stream_unary(
     request_iterator: AsyncIterator[bytes],
     context: aio.ServicerContext,
     channel: aio.Channel,
-    metadata: tuple[tuple[str, str], ...],
+    metadata: tuple[tuple[str, str | bytes], ...],
 ) -> bytes:
     """Proxy a stream-unary (client streaming) RPC."""
-    response = await channel.stream_unary(
-        method,
-        request_serializer=_IDENTITY,
-        response_deserializer=_IDENTITY,
-    )(request_iterator, metadata=metadata)
-    return response
+    try:
+        response = await channel.stream_unary(
+            method,
+            request_serializer=_IDENTITY,
+            response_deserializer=_IDENTITY,
+        )(request_iterator, metadata=metadata)
+        return response
+    except aio.AioRpcError as e:
+        await context.abort(e.code(), e.details() or "Backend error")
+        return b""  # unreachable
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +152,7 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
     them to the correct user's backend based on KBase token authentication.
     """
 
-    def __init__(
-        self, settings: ProxySettings, validator: TokenValidator, pool: ChannelPool
-    ):
+    def __init__(self, settings: ProxySettings, validator: TokenValidator, pool: ChannelPool):
         self._settings = settings
         self._validator = validator
         self._pool = pool
@@ -171,7 +180,7 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
         channel = self._pool.get_channel(target)
 
         # Forward original metadata (including x-kbase-token for server-side validation)
-        fwd_metadata = tuple(metadata) if metadata else ()
+        fwd_metadata: tuple[tuple[str, str | bytes], ...] = tuple(metadata) if metadata else ()
 
         logger.debug("Proxying %s for user %s → %s", method, username, target)
 
@@ -180,9 +189,7 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
         if req_type == "unary" and resp_type == "unary":
 
             async def unary_unary_behavior(request, context):
-                return await _proxy_unary_unary(
-                    method, request, context, channel, fwd_metadata
-                )
+                return await _proxy_unary_unary(method, request, context, channel, fwd_metadata)
 
             return grpc.unary_unary_rpc_method_handler(
                 unary_unary_behavior,
@@ -222,19 +229,19 @@ class SparkConnectProxyHandler(grpc.GenericRpcHandler):
     ) -> grpc.RpcMethodHandler:
         """Return a handler that immediately aborts with UNAUTHENTICATED."""
 
-        async def _abort_unary(request: bytes, context: aio.ServicerContext) -> bytes:
+        async def _abort_unary(_request: bytes, context: aio.ServicerContext) -> bytes:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, message)
             return b""  # unreachable but satisfies type checker
 
         async def _abort_stream(
-            request: bytes, context: aio.ServicerContext
+            _request: bytes, context: aio.ServicerContext
         ) -> AsyncIterator[bytes]:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, message)
             return  # type: ignore[return-value]
-            yield  # noqa: unreachable — makes this a generator
+            yield  # noqa: F841 — unreachable, makes this a generator
 
         async def _abort_client_stream(
-            request_iterator: AsyncIterator[bytes], context: aio.ServicerContext
+            _request_iterator: AsyncIterator[bytes], context: aio.ServicerContext
         ) -> bytes:
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, message)
             return b""
@@ -279,6 +286,7 @@ async def serve(settings: ProxySettings | None = None) -> None:
         auth_url=settings.KBASE_AUTH_URL,
         cache_ttl=settings.TOKEN_CACHE_TTL,
         cache_max_size=settings.TOKEN_CACHE_MAX_SIZE,
+        require_mfa=settings.REQUIRE_MFA,
     )
     pool = ChannelPool()
     handler = SparkConnectProxyHandler(settings, validator, pool)
@@ -289,9 +297,7 @@ async def serve(settings: ProxySettings | None = None) -> None:
     server.add_insecure_port(listen_addr)
 
     logger.info("Spark Connect Proxy starting on %s", listen_addr)
-    logger.info(
-        "Backend template: %s:%d", settings.SERVICE_TEMPLATE, settings.BACKEND_PORT
-    )
+    logger.info("Backend template: %s:%d", settings.SERVICE_TEMPLATE, settings.BACKEND_PORT)
 
     await server.start()
 
